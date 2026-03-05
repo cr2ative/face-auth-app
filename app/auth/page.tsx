@@ -3,9 +3,16 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
 import FaceCamera from "@/app/components/FaceCamera";
-import { fetchAllUsers, findBestMatch, type MatchResult } from "@/lib/supabase";
+import {
+  fetchAllUsers,
+  findBestMatch,
+  saveAuthLog,
+  fetchAuthLogs,
+  type MatchResult,
+  type AuthLog,
+} from "@/lib/supabase";
 
-const AUTH_THRESHOLD = 90; // 일치율 90% 이상이어야 인증 성공
+const AUTH_THRESHOLD = 70; // 일치율 70% 이상이어야 인증 성공
 
 type Step = "ready" | "scanning" | "success" | "fail";
 
@@ -15,11 +22,19 @@ export default function AuthPage() {
   const [authError, setAuthError] = useState("");
   const [isComparing, setIsComparing] = useState(false);
   const [dots, setDots] = useState(0);
+  const [logs, setLogs] = useState<AuthLog[]>([]);
 
-  // 중복 비교 방지
   const comparingRef = useRef(false);
 
-  // 로딩 점 애니메이션 (scanning 단계)
+  // 로그 조회 (ready 단계로 돌아올 때마다)
+  useEffect(() => {
+    if (step !== "ready") return;
+    fetchAuthLogs(5)
+      .then(setLogs)
+      .catch(() => {/* 조용히 무시 */});
+  }, [step]);
+
+  // 로딩 점 애니메이션
   useEffect(() => {
     if (step !== "scanning") return;
     const interval = setInterval(() => setDots(d => (d + 1) % 4), 450);
@@ -28,7 +43,6 @@ export default function AuthPage() {
 
   // ── 핵심: descriptor 받으면 Supabase와 비교 ──────────
   const handleDescriptor = useCallback(async (descriptor: Float32Array) => {
-    // 이미 비교 중이거나 완료된 경우 스킵
     if (comparingRef.current || step !== "scanning") return;
     comparingRef.current = true;
     setIsComparing(true);
@@ -37,14 +51,18 @@ export default function AuthPage() {
       const users = await fetchAllUsers();
 
       if (users.length === 0) {
-        setAuthError("등록된 사용자가 없습니다. 먼저 얼굴을 등록해주세요.");
+        const reason = "등록된 사용자가 없습니다. 먼저 얼굴을 등록해주세요.";
+        await saveAuthLog({ result: "fail", reason }).catch(() => {});
+        setAuthError(reason);
         setStep("fail");
         return;
       }
 
       const best = findBestMatch(descriptor, users);
       if (!best) {
-        setAuthError("비교에 실패했습니다.");
+        const reason = "비교에 실패했습니다.";
+        await saveAuthLog({ result: "fail", reason }).catch(() => {});
+        setAuthError(reason);
         setStep("fail");
         return;
       }
@@ -52,20 +70,32 @@ export default function AuthPage() {
       setMatchResult(best);
 
       if (best.similarity >= AUTH_THRESHOLD) {
+        await saveAuthLog({
+          user_name: best.user.name,
+          similarity: best.similarity,
+          distance: best.distance,
+          result: "success",
+        }).catch(() => {});
         setStep("success");
       } else {
-        setAuthError(
-          `가장 유사한 사용자: ${best.user.name} (${best.similarity}%)\n인증 기준 미달: ${AUTH_THRESHOLD}% 이상 필요`
-        );
+        const reason = `가장 유사한 사용자: ${best.user.name} (${best.similarity}%)\n인증 기준 미달: ${AUTH_THRESHOLD}% 이상 필요`;
+        await saveAuthLog({
+          user_name: best.user.name,
+          similarity: best.similarity,
+          distance: best.distance,
+          result: "fail",
+          reason,
+        }).catch(() => {});
+        setAuthError(reason);
         setStep("fail");
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "알 수 없는 오류";
+      await saveAuthLog({ result: "fail", reason: msg }).catch(() => {});
       setAuthError(msg);
       setStep("fail");
     } finally {
       setIsComparing(false);
-      // comparingRef는 step 전환 후에도 유지해 중복 방지
     }
   }, [step]);
 
@@ -83,6 +113,20 @@ export default function AuthPage() {
     setMatchResult(null);
     setAuthError("");
     setIsComparing(false);
+  };
+
+  // 로그 시각 포맷
+  const formatLogTime = (iso: string) => {
+    const d = new Date(iso);
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return "방금 전";
+    if (diffMin < 60) return `${diffMin}분 전`;
+    const diffH = Math.floor(diffMin / 60);
+    if (diffH < 24) return `${diffH}시간 전`;
+    const diffD = Math.floor(diffH / 24);
+    return `${diffD}일 전`;
   };
 
   return (
@@ -118,7 +162,7 @@ export default function AuthPage() {
         {/* ── READY 단계 ─────────────────────────────── */}
         {step === "ready" && (
           <div className="flex-1 flex flex-col fade-in-up">
-            {/* 카메라 프리뷰 (descriptor 미사용) */}
+            {/* 카메라 프리뷰 */}
             <div className="relative mx-auto w-64 h-64 mt-2 mb-6 rounded-3xl overflow-hidden">
               <FaceCamera active={true} showLandmarks={true} computeDescriptor={false} />
               {["top-3 left-3", "top-3 right-3 rotate-90", "bottom-3 left-3 -rotate-90", "bottom-3 right-3 rotate-180"].map((cls, i) => (
@@ -147,23 +191,28 @@ export default function AuthPage() {
               </div>
             </div>
 
-            {/* 최근 인증 내역 (정적 예시) */}
+            {/* 최근 인증 내역 (실제 DB) */}
             <div className="rounded-2xl bg-slate-900/60 border border-slate-800/60 px-5 py-4 mb-6">
               <p className="text-slate-500 text-xs font-medium mb-3 uppercase tracking-wider">최근 인증</p>
-              {[
-                { time: "오늘 09:42", status: "성공", color: "emerald" },
-                { time: "어제 18:15", status: "성공", color: "emerald" },
-                { time: "어제 08:30", status: "실패", color: "red" },
-              ].map((item, i) => (
-                <div key={i} className={`flex items-center justify-between py-2.5 ${i < 2 ? "border-b border-slate-800/60" : ""}`}>
-                  <span className="text-slate-400 text-sm">{item.time}</span>
-                  <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${
-                    item.color === "emerald"
-                      ? "text-emerald-400 bg-emerald-400/10 border border-emerald-400/20"
-                      : "text-red-400 bg-red-400/10 border border-red-400/20"
-                  }`}>{item.status}</span>
-                </div>
-              ))}
+              {logs.length === 0 ? (
+                <p className="text-slate-600 text-xs text-center py-3">인증 내역이 없습니다</p>
+              ) : (
+                logs.map((log, i) => (
+                  <div key={log.id} className={`flex items-center justify-between py-2.5 ${i < logs.length - 1 ? "border-b border-slate-800/60" : ""}`}>
+                    <div>
+                      <p className="text-slate-400 text-sm">{log.user_name ?? "알 수 없음"}</p>
+                      <p className="text-slate-600 text-xs mt-0.5">{formatLogTime(log.created_at)}{log.similarity != null ? ` · ${log.similarity}%` : ""}</p>
+                    </div>
+                    <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${
+                      log.result === "success"
+                        ? "text-emerald-400 bg-emerald-400/10 border border-emerald-400/20"
+                        : "text-red-400 bg-red-400/10 border border-red-400/20"
+                    }`}>
+                      {log.result === "success" ? "성공" : "실패"}
+                    </span>
+                  </div>
+                ))
+              )}
             </div>
 
             <button
@@ -193,7 +242,6 @@ export default function AuthPage() {
               {isComparing ? "DB와 비교 중..." : "얼굴을 화면에 위치시켜주세요"}
             </p>
 
-            {/* 카메라 (descriptor 추출 활성화) */}
             <div className="relative w-64 h-64 mb-8">
               <FaceCamera
                 active={true}
@@ -201,18 +249,15 @@ export default function AuthPage() {
                 computeDescriptor={!isComparing}
                 onDescriptor={handleDescriptor}
               />
-              {/* 스캔 라인 */}
               {!isComparing && (
                 <div className="scan-line absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-blue-400/80 to-transparent z-20 pointer-events-none" />
               )}
-              {/* 비교 중 오버레이 */}
               {isComparing && (
                 <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-[#070B14]/80 rounded-3xl backdrop-blur-sm">
                   <div className="w-12 h-12 rounded-full border-2 border-blue-800/30 border-t-blue-500 border-r-blue-500 animate-spin mb-3" />
                   <p className="text-blue-300 text-sm font-medium">DB 비교 중...</p>
                 </div>
               )}
-              {/* 코너 마커 */}
               {["top-3 left-3", "top-3 right-3 rotate-90", "bottom-3 left-3 -rotate-90", "bottom-3 right-3 rotate-180"].map((cls, i) => (
                 <div key={i} className={`absolute ${cls} w-7 h-7 z-20 pointer-events-none`}>
                   <svg viewBox="0 0 24 24" fill="none">
@@ -222,7 +267,6 @@ export default function AuthPage() {
               ))}
             </div>
 
-            {/* 진행 단계 표시 */}
             <div className="flex items-center gap-2 mb-6">
               {["얼굴 감지", "특징 추출", "DB 비교"].map((label, i) => (
                 <div key={i} className="flex items-center gap-2">
@@ -248,7 +292,6 @@ export default function AuthPage() {
         {/* ── SUCCESS 단계 ────────────────────────────── */}
         {step === "success" && matchResult && (
           <div className="flex-1 flex flex-col items-center justify-center fade-in-up pb-12">
-            {/* 성공 아이콘 */}
             <div className="relative mb-6">
               <div className="w-32 h-32 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center">
                 <div className="w-24 h-24 rounded-full bg-emerald-500/20 border border-emerald-400/30 flex items-center justify-center">
@@ -263,29 +306,22 @@ export default function AuthPage() {
             <p className="text-emerald-400 text-base font-semibold mb-1">{matchResult.user.name}</p>
             <p className="text-slate-400 text-xs mb-8">신원이 확인되었습니다</p>
 
-            {/* 일치율 게이지 */}
             <div className="w-full rounded-2xl bg-slate-900/60 border border-slate-800/60 p-5 mb-6">
               <div className="flex items-center justify-between mb-3">
                 <span className="text-slate-400 text-sm">얼굴 일치율</span>
                 <span className="text-emerald-400 text-xl font-bold">{matchResult.similarity}%</span>
               </div>
-              {/* 진행 바 */}
               <div className="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden mb-4">
                 <div
                   className="h-full rounded-full transition-all duration-1000"
-                  style={{
-                    width: `${matchResult.similarity}%`,
-                    background: `linear-gradient(90deg, #10B981, #34D399)`,
-                  }}
+                  style={{ width: `${matchResult.similarity}%`, background: "linear-gradient(90deg, #10B981, #34D399)" }}
                 />
               </div>
-              {/* 기준선 표시 */}
               <div className="flex items-center justify-between text-xs text-slate-600 mb-4">
                 <span>0%</span>
                 <span className="text-slate-500">기준: {AUTH_THRESHOLD}%</span>
                 <span>100%</span>
               </div>
-              {/* 상세 정보 */}
               {[
                 { label: "인증된 사용자", value: matchResult.user.name },
                 { label: "벡터 거리", value: matchResult.distance.toFixed(4) },
@@ -320,7 +356,6 @@ export default function AuthPage() {
         {/* ── FAIL 단계 ───────────────────────────────── */}
         {step === "fail" && (
           <div className="flex-1 flex flex-col items-center justify-center fade-in-up pb-12">
-            {/* 실패 아이콘 */}
             <div className="relative mb-6">
               <div className="w-32 h-32 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center">
                 <div className="w-24 h-24 rounded-full bg-red-500/20 border border-red-400/30 flex items-center justify-center">
@@ -334,7 +369,6 @@ export default function AuthPage() {
             <h3 className="text-white font-bold text-2xl mb-2">인증 실패</h3>
             <p className="text-red-400 text-sm mb-8 text-center leading-relaxed whitespace-pre-line">{authError}</p>
 
-            {/* 일치율 있으면 표시 */}
             {matchResult && (
               <div className="w-full rounded-2xl bg-slate-900/60 border border-red-900/30 p-5 mb-6">
                 <div className="flex items-center justify-between mb-3">
