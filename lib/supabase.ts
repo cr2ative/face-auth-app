@@ -1,8 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
 
+// 빌드 타임에 env 미설정 시 에러 방지 (런타임에는 실제값 사용)
 export const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  process.env.NEXT_PUBLIC_SUPABASE_URL ?? "https://placeholder.supabase.co",
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "placeholder-anon-key"
 );
 
 // ── 타입 ──────────────────────────────────────────────
